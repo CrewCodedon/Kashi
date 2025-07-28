@@ -1,0 +1,30 @@
+Transkritpion:
+ 1. Audioeingabe, keine speicherung der Audioeingabe
+ 2. audio an googl cloud gemini transkription
+ 3. zusammenfassung der dokumentation bei "C:\Users\Praxis\Desktop\DiktierAssistent"
+
+
+Microsoft Power automate
+1. Trigger: Dateiüberwachung auf pfad wo output.txt ist (existiert die datei hier?)
+2. Aktion: Dateiinhalt lesen
+3. Aktion: Text in Zwischenablage kopieren
+4. Aktion: DAMPSOFT-Fenster fokussieren (Fenstertitel: "DAMPSOFT")
+5. Aktion: Zum Kommentarfeld navigieren (Tab-Taste x-mal)
+6. Aktion: Strg+A (alles markieren)
+7. Aktion: Strg+V (einfügen)
+
+-> gerade:
+   scritp main.py läuft in C:\DiktierAssistent\ hier alle files (Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----        08.07.2025     18:33                venv
+-a----        17.07.2025     19:22            607 flow_dampsoft.txt
+-a----        17.07.2025     17:24          17456 main.py
+-a----        08.07.2025     17:51          14496 Plan.txt
+-a----        14.07.2025     15:41             55 requirements.txt
+-a----        17.07.2025     16:52           2348 service-account-key.json
+
+--> jetziger microsoftPowerAutomate flow in Automate.txt
+
+--> was fehlt:
+    error handling mit retry Mechanismen
+    1. Das konzept ist gerade, dass man einfach mit strg + 8 das popup öffnet und dann eine neue dokumentation 

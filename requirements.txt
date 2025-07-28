@@ -1,0 +1,8 @@
+sounddevice
+soundfile
+numpy
+psutil
+vertexai
+google-auth
+pystray
+keyboard

@@ -1,0 +1,461 @@
+# Kompletter Umsetzungsplan: Diktier-Assistent für DAMPSOFT
+
+## 🎯 Ziel
+Ein per Hotkey (z.B. F9) startbarer Desktop-Assistent, der Patientengespräche transkribiert und automatisch in das Kommentarfeld von DAMPSOFT einfügt.
+
+---
+
+## 📋 Vorbereitung auf Ihrem MacBook
+
+### 1. Code-Entwicklung (auf Ihrem Mac)
+
+**a) Neues Python-Skript erstellen:**
+- Öffnen Sie einen Text-Editor (TextEdit im Plain-Text-Modus oder besser: Visual Studio Code kostenlos downloaden)
+- Erstellen Sie eine neue Datei `diktier_desktop.py`
+
+**b) Benötigter Code:**
+```python
+import tkinter as tk
+from tkinter import ttk
+import sounddevice as sd
+import soundfile as sf
+import numpy as np
+import google.generativeai as genai
+import json
+import os
+import threading
+import time
+from datetime import datetime
+import tempfile
+import keyboard
+
+class DiktierAssistent:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Diktier-Assistent für DAMPSOFT")
+        self.root.geometry("400x250")
+        self.root.attributes('-topmost', True)  # Immer im Vordergrund
+        
+        # Google AI Setup
+        self.setup_google_ai()
+        
+        # Audio-Variablen
+        self.is_recording = False
+        self.audio_data = []
+        self.sample_rate = 16000
+        
+        # UI erstellen
+        self.create_ui()
+        
+    def setup_google_ai(self):
+        # JSON-Schlüssel laden
+        try:
+            with open('service-account-key.json', 'r') as f:
+                credentials = json.load(f)
+            
+            # Hier müssen Sie den korrekten Authentifizierungsprozess für Service Accounts implementieren
+            # Für Gemini API verwenden Sie normalerweise einen API-Key, nicht einen Service Account
+            # Falls Sie einen Service Account haben, benötigen Sie google-auth:
+            # from google.oauth2 import service_account
+            # credentials = service_account.Credentials.from_service_account_file('service-account-key.json')
+            
+            genai.configure(api_key="YOUR_API_KEY")  # Temporär - ersetzen durch Service Account Auth
+            self.model = genai.GenerativeModel('models/gemini-1.5-flash-latest')
+            
+        except Exception as e:
+            print(f"Fehler beim Laden der Credentials: {e}")
+            
+    def create_ui(self):
+        # Status-Label
+        self.status_label = ttk.Label(self.root, text="Bereit - Drücken Sie F9 oder klicken Sie Start", 
+                                     font=("Arial", 12))
+        self.status_label.pack(pady=20)
+        
+        # Start/Stop Button
+        self.record_button = ttk.Button(self.root, text="▶️ Start Aufnahme", 
+                                       command=self.toggle_recording,
+                                       style="Accent.TButton")
+        self.record_button.pack(pady=10)
+        
+        # Progress Bar
+        self.progress = ttk.Progressbar(self.root, mode='indeterminate')
+        self.progress.pack(pady=10, padx=20, fill=tk.X)
+        
+        # Info-Text
+        info_text = "F9: Start/Stop | ESC: Fenster schließen"
+        ttk.Label(self.root, text=info_text, font=("Arial", 9)).pack(pady=5)
+        
+        # Keyboard Shortcuts
+        self.root.bind('<F9>', lambda e: self.toggle_recording())
+        self.root.bind('<Escape>', lambda e: self.root.quit())
+        
+    def toggle_recording(self):
+        if not self.is_recording:
+            self.start_recording()
+        else:
+            self.stop_recording()
+            
+    def start_recording(self):
+        self.is_recording = True
+        self.audio_data = []
+        self.record_button.config(text="⏹️ Stop Aufnahme")
+        self.status_label.config(text="🔴 Aufnahme läuft...")
+        
+        # Aufnahme in separatem Thread
+        self.record_thread = threading.Thread(target=self.record_audio)
+        self.record_thread.start()
+        
+    def record_audio(self):
+        with sd.InputStream(samplerate=self.sample_rate, channels=1, 
+                           callback=self.audio_callback):
+            while self.is_recording:
+                time.sleep(0.1)
+                
+    def audio_callback(self, indata, frames, time, status):
+        if self.is_recording:
+            self.audio_data.append(indata.copy())
+            
+    def stop_recording(self):
+        self.is_recording = False
+        self.record_button.config(text="⏳ Verarbeite...", state="disabled")
+        self.status_label.config(text="Verarbeite Aufnahme...")
+        self.progress.start()
+        
+        # Verarbeitung in separatem Thread
+        process_thread = threading.Thread(target=self.process_audio)
+        process_thread.start()
+        
+    def process_audio(self):
+        try:
+            # Audio zusammenfügen und speichern
+            audio_array = np.concatenate(self.audio_data, axis=0)
+            
+            # Temporäre Datei
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_file:
+                sf.write(tmp_file.name, audio_array, self.sample_rate)
+                temp_path = tmp_file.name
+            
+            # Upload zu Gemini
+            self.root.after(0, lambda: self.status_label.config(text="Lade Audio hoch..."))
+            audio_file = genai.upload_file(path=temp_path)
+            
+            # Transkription
+            self.root.after(0, lambda: self.status_label.config(text="Transkribiere..."))
+            response_transcribe = self.model.generate_content(
+                ["Bitte transkribiere das folgende deutsche Audio exakt wie gesprochen:", audio_file],
+                request_options={'timeout': 600}
+            )
+            transcript = response_transcribe.text
+            
+            # Zusammenfassung
+            self.root.after(0, lambda: self.status_label.config(text="Erstelle Zusammenfassung..."))
+            prompt_summarize = """
+            Du bist eine zahnmedizinische Fachassistenz. Erstelle aus der folgenden Transkription eine strukturierte Dokumentation für DAMPSOFT.
+            
+            Formatiere die Ausgabe wie folgt:
+            
+            BEFUND:
+            [Hier die relevanten Befunde]
+            
+            DIAGNOSE:
+            [Diagnosen mit ICD-10 wenn möglich]
+            
+            THERAPIE:
+            [Durchgeführte/geplante Behandlungen]
+            
+            BEMERKUNGEN:
+            [Weitere relevante Informationen]
+            
+            Transkription:
+            """
+            
+            response_summarize = self.model.generate_content(prompt_summarize + transcript)
+            summary = response_summarize.text
+            
+            # In Datei speichern für Power Automate
+            output_path = r"C:\DiktierAssistent\output.txt"
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(summary)
+                
+            # Aufräumen
+            genai.delete_file(audio_file.name)
+            os.unlink(temp_path)
+            
+            # UI aktualisieren
+            self.root.after(0, self.reset_ui)
+            self.root.after(0, lambda: self.status_label.config(
+                text="✅ Erfolgreich! Text wurde an DAMPSOFT übergeben."))
+            
+        except Exception as e:
+            self.root.after(0, lambda: self.status_label.config(
+                text=f"❌ Fehler: {str(e)}"))
+            self.root.after(0, self.reset_ui)
+            
+    def reset_ui(self):
+        self.progress.stop()
+        self.record_button.config(text="▶️ Start Aufnahme", state="normal")
+        
+        # Nach 3 Sekunden zurück zu "Bereit"
+        self.root.after(3000, lambda: self.status_label.config(
+            text="Bereit - Drücken Sie F9 oder klicken Sie Start"))
+
+# Hauptprogramm
+if __name__ == "__main__":
+    # Prüfen ob bereits eine Instanz läuft
+    import psutil
+    current_pid = os.getpid()
+    for proc in psutil.process_iter(['pid', 'name']):
+        if proc.info['name'] == 'python.exe' and proc.info['pid'] != current_pid:
+            # Prüfen ob es unser Skript ist
+            try:
+                if 'diktier_desktop.py' in ' '.join(proc.cmdline()):
+                    print("Anwendung läuft bereits")
+                    exit()
+            except:
+                pass
+    
+    root = tk.Tk()
+    app = DiktierAssistent(root)
+    
+    # Globaler Hotkey (F9) auch wenn Fenster nicht im Fokus
+    keyboard.add_hotkey('f9', app.toggle_recording)
+    
+    root.mainloop()
+```
+
+**c) Zusätzliche Dateien vorbereiten:**
+
+1. **requirements.txt** erstellen:
+```
+sounddevice
+soundfile
+numpy
+google-generativeai
+keyboard
+psutil
+```
+
+2. **Power Automate Flow** (flow_dampsoft.txt):
+```
+1. Trigger: Dateiüberwachung auf C:\DiktierAssistent\output.txt
+2. Aktion: Dateiinhalt lesen
+3. Aktion: Text in Zwischenablage kopieren
+4. Aktion: DAMPSOFT-Fenster fokussieren (Fenstertitel: "DAMPSOFT")
+5. Aktion: Zum Kommentarfeld navigieren (Tab-Taste x-mal)
+6. Aktion: Strg+A (alles markieren)
+7. Aktion: Strg+V (einfügen)
+8. Aktion: Datei löschen
+```
+
+---
+
+## 🚀 Test-Phase (Behandlungszimmer-PC)
+
+### 2. Dateien auf Test-PC übertragen
+
+**a) Auf Ihrem Mac:**
+1. Erstellen Sie einen Ordner "DiktierAssistent_Transfer"
+2. Kopieren Sie hinein:
+   - `diktier_desktop.py`
+   - `requirements.txt`
+   - `flow_dampsoft.txt`
+   - `service-account-key.json` (Ihr Google Service Account)
+   - Diese Anleitung als PDF
+
+**b) Transfer via USB:**
+1. USB-Stick an Mac anschließen (USB-C zu USB Adapter)
+2. Ordner auf USB-Stick kopieren
+3. USB-Stick sicher auswerfen
+4. Am Windows-PC einstecken
+
+### 3. Installation auf Test-PC
+
+**a) Python installieren:**
+1. Browser öffnen: python.org
+2. Download Python 3.12.x (64-bit)
+3. Bei Installation: ✅ "Add Python to PATH" ankreuzen!
+4. Installation durchführen
+
+**b) Code-Editor (optional aber empfohlen):**
+1. Notepad++ downloaden (kostenlos) oder
+2. Visual Studio Code (kostenlos, mehr Features)
+
+**c) Projekt einrichten:**
+1. Ordner `C:\DiktierAssistent` erstellen
+2. Alle Dateien vom USB-Stick hierhin kopieren
+3. Windows-Eingabeaufforderung öffnen (Win+R, "cmd")
+4. Navigieren: `cd C:\DiktierAssistent`
+5. Virtuelle Umgebung erstellen:
+   ```
+   python -m venv venv
+   venv\Scripts\activate
+   ```
+6. Pakete installieren:
+   ```
+   pip install -r requirements.txt
+   ```
+
+### 4. Erste Tests
+
+**a) Skript direkt testen:**
+```
+python diktier_desktop.py
+```
+
+**b) Problembehebung:**
+- Fehler "Modul nicht gefunden": `pip install [modulname]`
+- Mikrofon-Fehler: Windows-Soundeinstellungen prüfen
+- API-Fehler: Service-Account-Key prüfen
+
+### 5. Power Automate einrichten
+
+**a) Power Automate Desktop installieren:**
+1. Microsoft Store öffnen
+2. "Power Automate" suchen und installieren
+3. Mit Microsoft-Konto anmelden
+
+**b) Flow erstellen:**
+1. Neuer Flow: "DAMPSOFT Diktat-Integration"
+2. Trigger hinzufügen: "On file created"
+   - Ordner: `C:\DiktierAssistent`
+   - Datei: `output.txt`
+3. Aktionen gemäß flow_dampsoft.txt hinzufügen
+4. DAMPSOFT-spezifische Anpassungen:
+   - Fenstertitel von DAMPSOFT ermitteln (mit Alt+Tab sichtbar)
+   - Anzahl TAB-Tastendrücke zum Kommentarfeld testen
+5. Flow aktivieren
+
+### 6. Desktop-Verknüpfung mit Hotkey
+
+**a) Batch-Datei erstellen** (start_diktat.bat):
+```batch
+@echo off
+cd /d C:\DiktierAssistent
+venv\Scripts\python.exe diktier_desktop.py
+```
+
+**b) Desktop-Verknüpfung:**
+1. Rechtsklick auf Desktop → Neu → Verknüpfung
+2. Ziel: `C:\DiktierAssistent\start_diktat.bat`
+3. Name: "Diktier-Assistent"
+4. Rechtsklick auf Verknüpfung → Eigenschaften
+5. Tastenkombination: F9 (oder andere)
+6. Ausführen: Minimiert
+
+### 7. Kompletttest
+
+1. DAMPSOFT öffnen und Patient auswählen
+2. F9 drücken (Assistent startet)
+3. Kurzen Test-Text sprechen
+4. F9 erneut drücken (stoppt Aufnahme)
+5. Warten bis "Erfolgreich" erscheint
+6. Prüfen ob Text in DAMPSOFT erscheint
+
+---
+
+## 🏢 Rollout auf alle 5 PCs
+
+### 8. Deployment-Paket erstellen
+
+**Auf Test-PC nach erfolgreichen Tests:**
+
+1. **Installer-Ordner** erstellen mit:
+   - Python-Installer (python-3.12.x-amd64.exe)
+   - Kompletter C:\DiktierAssistent Ordner (gezippt)
+   - install_diktat.bat (Automatisiertes Setup-Skript)
+   - Power Automate Flow Export (.pad Datei)
+
+2. **install_diktat.bat**:
+```batch
+@echo off
+echo Installing Diktier-Assistent...
+
+REM Python installieren (silent)
+python-3.12.x-amd64.exe /quiet PrependPath=1
+
+REM Warten
+timeout /t 30
+
+REM Projekt entpacken
+xcopy /E /I DiktierAssistent C:\DiktierAssistent
+
+REM Virtuelle Umgebung und Pakete
+cd C:\DiktierAssistent
+python -m venv venv
+call venv\Scripts\activate
+pip install -r requirements.txt
+
+REM Desktop-Verknüpfung
+copy start_diktat.lnk "%USERPROFILE%\Desktop\"
+
+echo Installation abgeschlossen!
+pause
+```
+
+### 9. Installation auf jedem PC
+
+1. Deployment-Paket auf USB-Stick
+2. An jedem PC:
+   - Als Administrator anmelden
+   - install_diktat.bat ausführen
+   - Power Automate Flow importieren
+   - DAMPSOFT-spezifische Anpassungen testen
+   - Hotkey-Verknüpfung prüfen
+
+### 10. Zentrale Wartung (Optional)
+
+**Server-basierte Updates:**
+1. Netzlaufwerk erstellen: `\\Server\DiktierAssistent`
+2. Update-Skript das neue Versionen vom Server holt
+3. Geplante Task für automatische Updates
+
+---
+
+## ✅ Checkliste pro PC
+
+- [ ] Python 3.12 installiert (mit PATH)
+- [ ] C:\DiktierAssistent eingerichtet
+- [ ] Alle Python-Pakete installiert
+- [ ] Service-Account-Key vorhanden
+- [ ] Power Automate Flow läuft
+- [ ] Desktop-Verknüpfung mit F9
+- [ ] Test mit DAMPSOFT erfolgreich
+- [ ] Mikrofon funktioniert
+- [ ] Autostart eingerichtet (optional)
+
+---
+
+## 🔧 Troubleshooting
+
+**Problem: "Python nicht gefunden"**
+- Lösung: PATH-Variable prüfen, Python neu installieren
+
+**Problem: "Mikrofon-Fehler"**
+- Lösung: Windows-Datenschutz → Mikrofon-Zugriff erlauben
+
+**Problem: "DAMPSOFT erhält keinen Text"**
+- Lösung: Power Automate Flow debuggen, Fenstertitel prüfen
+
+**Problem: "API-Authentifizierung fehlgeschlagen"**
+- Lösung: Service-Account-Key prüfen, Berechtigungen checken
+
+---
+
+## 📞 Support-Kontakte
+
+- Interner IT-Support: [Nummer]
+- Google Cloud Support: [falls vorhanden]
+- DAMPSOFT Support: [Nummer]
+
+---
+
+## 🎯 Erwartetes Endergebnis
+
+Nach vollständiger Implementation:
+1. Arzt drückt F9 → Fenster erscheint
+2. Arzt spricht → Visuelles Feedback
+3. Arzt drückt F9 → Verarbeitung startet
+4. Nach ~10-15 Sekunden: Text erscheint automatisch in DAMPSOFT
+5. Assistent ist bereit für nächste Aufnahme
