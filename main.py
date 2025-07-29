@@ -27,12 +27,16 @@ import requests
 from PIL import Image, ImageTk
 from io import BytesIO
 import math
+import atexit
+import signal
+import sys
 
 class DiktierAssistent:
     def __init__(self, root):
         self.root = root
         self.root.title("TranskriptionsAgent")
         self.root.geometry("500x500")
+        self.root.resizable(False, False)  # Fenster nicht veränderbar machen
         self.root.attributes('-topmost', True)
 
         # Diese Zeile ist weiterhin wichtig und muss bleiben!
@@ -55,16 +59,31 @@ class DiktierAssistent:
         self.all_recordings = []
         self.sample_rate = 16000
         self.recording_count = 0
+        
+        # Audio-Ordner Setup (versteckt im Root-Directory)
+        self.audio_folder = os.path.join('.', '.audio_temp')
+        os.makedirs(self.audio_folder, exist_ok=True)
+
+        # >>> HIER DIE ÄNDERUNG EINFÜGEN <<<
+        # Alte Audio-Dateien beim Start löschen
+        self.clear_audio_files()
+        
+        # Cleanup-Handler registrieren
+        atexit.register(self.cleanup_on_exit)
+        signal.signal(signal.SIGTERM, self.signal_handler)
+        signal.signal(signal.SIGINT, self.signal_handler)
 
         # Animation Variablen
         self.animation_running = False
         self.wave_radius = 0
         self.wave_alpha = 255
+        self.loading_rotation = 0
+        self.loading_animation_running = False
+        self.fade_alpha = 1.0
 
         # Icons laden
         self.load_icons()
 
-        self.progress = None
         self.finished_label = None
         self.transcript_options_frame = None
         
@@ -86,6 +105,43 @@ class DiktierAssistent:
         # Global hotkey
         self.setup_global_hotkey()
 
+    def create_mode_buttons(self):
+        """Erstellt die Auswahl-Buttons für Neues/Ergänzen"""
+        # Container Frame für die Buttons
+        self.mode_buttons_frame = tk.Frame(self.canvas, bg='#f0f0f0', width=300, height=250) # Geben Sie dem Frame eine Größe
+
+        # Neues Transkript Button
+        self.new_transcript_btn = tk.Button(
+            self.mode_buttons_frame,
+            image=self.icons['new'],
+            command=self.start_new_transcript,
+            relief="flat",
+            borderwidth=0,
+            bg='#f0f0f0',
+            activebackground='#f0f0f0',
+            cursor="hand2"
+        )
+        # ✅ HIER WURDE ANGEPASST: Startposition für die neuen Dimensionen
+        self.new_transcript_btn.place(relx=0.5, y=25, anchor='n')
+
+        # Transkript ergänzen Button
+        self.append_transcript_btn = tk.Button(
+            self.mode_buttons_frame,
+            image=self.icons['append'],
+            command=self.start_append_mode,
+            relief="flat",
+            borderwidth=0,
+            bg='#f0f0f0',
+            activebackground='#f0f0f0',
+            cursor="hand2"
+        )
+        # ✅ HIER WURDE ANGEPASST: y-Wert für die Überlappung der 110px hohen Buttons
+        self.append_transcript_btn.place(relx=0.5, y=110, anchor='n')
+
+        # Buttons initial verstecken - werden nach erfolgreicher Transkription angezeigt
+        # Das Fenster, das den Frame enthält, wird weiterhin im Canvas zentriert.
+        self.mode_buttons_window = self.canvas.create_window(150, 125, window=self.mode_buttons_frame, state='hidden')
+        
     def create_rounded_rectangle(self, canvas, x1, y1, x2, y2, radius=25, **kwargs):
         """Zeichnet ein abgerundetes Rechteck auf einem Canvas."""
         points = [x1 + radius, y1,
@@ -114,12 +170,16 @@ class DiktierAssistent:
         """Lädt Icons aus lokalen Dateien (gemischte Formate)"""
         icon_files = {
             'logo': 'ProzessagentLogo.png',
-            'mic': 'MikrofonIcon.png', 
+            'mic': 'MikrofonIcon.png',
             'trash': 'MplltonnenIcon.png',
             'cross': 'Kreuz.png',
-            'check': 'Haken.png'
+            'check': 'Haken.png',
+            'loading': 'LoadingArrow.png',
+            'arrow_left': 'ArrowLeft.png',
+            'new': 'neu.png',
+            'append': 'ergänzen.png'
         }
-        
+
         self.icons = {}
         for name, filename in icon_files.items():
             try:
@@ -143,23 +203,34 @@ class DiktierAssistent:
                         # Erstelle einen neuen, soliden Hintergrund in der App-Farbe
                         bg_color = '#f0f0f0'
                         background = Image.new('RGBA', img.size, bg_color)
-                        
+
                         # Füge das transparente Icon auf den soliden Hintergrund
                         background.paste(img, (0, 0), img)
                         img = background
-                
+
                 # Icons skalieren
                 if name == 'logo':
                     # Seitenverhältnis von 1080:700 ist ca. 1.54.
                     img = img.resize((120, 78), Image.Resampling.LANCZOS)
                 elif name == 'mic':
                     img = img.resize((150, 150), Image.Resampling.LANCZOS) # Größer gemacht
+                elif name == 'loading':
+                    img = img.resize((150, 150), Image.Resampling.LANCZOS) # Gleiche Größe wie Mikrofon
+                
+                # ✅ HIER WURDE ANGEPASST
+                elif name == 'arrow_left':
+                    # ArrowLeft ist quadratisch (1080x1080), wird hier korrekt skaliert.
+                    img = img.resize((40, 40), Image.Resampling.LANCZOS)
+                elif name in ['new', 'append']:
+                    # Skaliert die 980x540 Bilder auf eine passende Größe von 200x110,
+                    # um in das Fenster zu passen.
+                    img = img.resize((140, 77), Image.Resampling.LANCZOS)
                 else:
                     img = img.resize((50, 50), Image.Resampling.LANCZOS)
-                
+
                 self.icons[name] = ImageTk.PhotoImage(img)
                 print(f"✓ Icon geladen: {name} ({filename})")
-                
+
             except Exception as e:
                 print(f"Fehler beim Laden von {filename}: {e}")
                 self.create_fallback_icon(name)
@@ -269,35 +340,56 @@ class DiktierAssistent:
         self.root.configure(bg='#f0f0f0')
                 
         # Top Frame für Logo und Counter (horizontal nebeneinander)
-        top_frame = tk.Frame(self.root, bg='#f0f0f0')
+        top_frame = tk.Frame(self.root, bg='#f0f0f0', width=500, height=90)
+
+        # DIES IST DIE ENTSCHEIDENDE ZEILE: Verhindert, dass der Frame schrumpft
+        top_frame.pack_propagate(False)
+
+        # Packen Sie den Frame wie gewohnt
         top_frame.pack(pady=(20, 10))
 
-        # Container für Logo und Counter (zentriert)
-        logo_counter_container = tk.Frame(top_frame, bg='#f0f0f0')
-        logo_counter_container.pack(expand=True)
+        # KORREKTUR 1: Den Container von Anfang an als 'self.logo_counter_container' erstellen
+        self.logo_counter_container = tk.Frame(top_frame, bg='#f0f0f0')
+        self.logo_counter_container.pack(expand=True)
 
+        # KORREKTUR 2: Den 'self'-Container für die Kind-Elemente verwenden
         # Logo zentriert
-        logo_label = tk.Label(logo_counter_container, image=self.icons['logo'], bg='#f0f0f0')
-        logo_label.pack(side='left', padx=(100, 10)) # <-- Wert von 65 auf 80 erhöht
+        self.logo_label = tk.Label(self.logo_counter_container, image=self.icons['logo'], bg='#f0f0f0')
+        self.logo_label.pack(side='left', padx=(100, 10))
 
         # Counter direkt neben dem Logo
-        self.counter_canvas = tk.Canvas(logo_counter_container, width=60, height=40, bg='#f0f0f0', highlightthickness=0)
-        # HIER IST DIE GEÄNDERTE ZEILE:
-        self.counter_canvas.pack(side='left', padx=(20, 0)) # <-- Geändert: 20px Leerraum links vom Zähler hinzugefügt
+        self.counter_canvas = tk.Canvas(self.logo_counter_container, width=60, height=40, bg='#f0f0f0', highlightthickness=0)
+        self.counter_canvas.pack(side='left', padx=(20, 0))
         self.create_rounded_rectangle(self.counter_canvas, 2, 2, 58, 38, radius=15, fill='#6B8EF5', outline="")
         self.counter_text = self.counter_canvas.create_text(30, 21, text="0", font=("Arial", 16, "bold"), fill="white")
         
         # Canvas für Mikrofon und Animation
         self.canvas = Canvas(self.root, width=300, height=250, bg='#f0f0f0', highlightthickness=0)
-        self.canvas.pack(pady=(10, 5))  # Unten weniger Abstand
+        self.canvas.pack(pady=(10, 5))
+
+        # KORREKTUR 3: Die doppelte, leere Erstellung des Containers wurde hier GELÖSCHT.
+        
+        # Zurück-Pfeil erstellen (initial versteckt) - Dein korrekter Code bleibt hier.
+        self.back_arrow = tk.Button(top_frame, image=self.icons['arrow_left'],
+                        command=self.cancel_append_mode, borderwidth=0,
+                        bg='#f0f0f0', activebackground='#f0f0f0')
         
         # Mikrofon-Button (zentriert)
         self.mic_button = self.canvas.create_image(150, 125, image=self.icons['mic'])
         self.canvas.tag_bind(self.mic_button, '<Button-1>', lambda e: self.toggle_recording())
         
+        # Loading-Button (versteckt)
+        self.loading_button = self.canvas.create_image(150, 125, image=self.icons['loading'], state='hidden')
+        
+        # Auswahlbuttons erstellen (initial versteckt)
+        self.create_mode_buttons()
+        
+        # Modus-Status
+        self.mode = 'initial'
+        
         # Button-Frame unten
         button_frame = tk.Frame(self.root, bg='#f0f0f0')
-        button_frame.pack(pady=(0, 20))  # Oben kein Abstand mehr, die Buttons rücken näher
+        button_frame.pack(pady=(0, 20))
         
         # Mülltonne Button
         self.trash_button = tk.Button(button_frame, image=self.icons['trash'], 
@@ -386,6 +478,63 @@ class DiktierAssistent:
         # Nächsten Animationsschritt planen
         if self.animation_running:
             self.root.after(40, self.animate_waves) # 40ms für eine flüssige Animation
+    
+    def animate_loading(self):
+        """Animiert die drehende LoadingArrow während der Transkription"""
+        if not self.loading_animation_running:
+            return
+            
+        # Rotation animieren
+        self.loading_rotation = (self.loading_rotation + 5) % 360
+        
+        # Bild drehen
+        try:
+            # Original-Bild nur einmal laden und in höherer Auflösung
+            if not hasattr(self, 'loading_original'):
+                self.loading_original = Image.open('LoadingArrow.png').convert("RGBA")
+                # Größer laden für bessere Qualität bei Rotation
+                self.loading_original = self.loading_original.resize((300, 300), Image.Resampling.LANCZOS)
+            
+            # Rotation mit besseren Einstellungen
+            rotated_img = self.loading_original.rotate(-self.loading_rotation, 
+                                                      resample=Image.Resampling.BICUBIC, 
+                                                      expand=False)
+            
+            # Auf Zielgröße verkleinern nach der Rotation
+            final_img = rotated_img.resize((150, 150), Image.Resampling.LANCZOS)
+            
+            # Zu PhotoImage konvertieren
+            self.icons['loading_rotated'] = ImageTk.PhotoImage(final_img)
+            
+            # Canvas-Bild aktualisieren
+            self.canvas.itemconfig(self.loading_button, image=self.icons['loading_rotated'])
+            
+        except Exception as e:
+            print(f"Fehler bei Loading-Animation: {e}")
+        
+        # Nächsten Animationsschritt planen
+        if self.loading_animation_running:
+            self.root.after(30, self.animate_loading)  # 30ms für flüssige Rotation
+    
+    def show_loading_animation(self):
+        """Zeigt die Loading-Animation und versteckt das Mikrofon"""
+        # Mikrofon ausblenden
+        self.canvas.itemconfig(self.mic_button, state='hidden')
+        # Loading-Icon einblenden
+        self.canvas.itemconfig(self.loading_button, state='normal')
+        # Animation starten
+        self.loading_animation_running = True
+        self.loading_rotation = 0
+        self.animate_loading()
+    
+    def hide_loading_animation(self):
+        """Versteckt die Loading-Animation und zeigt das Mikrofon wieder"""
+        # Loading-Animation stoppen
+        self.loading_animation_running = False
+        # Loading-Icon ausblenden
+        self.canvas.itemconfig(self.loading_button, state='hidden')
+        # Mikrofon wieder einblenden
+        self.canvas.itemconfig(self.mic_button, state='normal')
 
     def delete_last_recording(self):
         """Löscht die letzte Aufnahme"""
@@ -479,32 +628,7 @@ class DiktierAssistent:
         self.delete_dialog.destroy()
     
 
-    def set_append_mode(self):
-        # Modus zum Ergänzen eines bestehenden Transkripts aktivieren
-        self.append_mode = True
-        self.transcript_options_frame.pack_forget()
-        self.status_label.config(text="Modus: Transkript ergänzen - Neue Aufnahme startet...")
-        self.root.after(1000, self.reset_for_new_recording)
-        
-    def set_new_mode(self):
-        # Modus für ein komplett neues Transkript aktivieren
-        self.append_mode = False
-        self.existing_transcript = ""
-        self.has_transcript = False
-        self.transcript_options_frame.pack_forget()
-        self.status_label.config(text="Modus: Neues Transkript - Neue Aufnahme startet...")
-        self.root.after(1000, self.reset_for_new_recording)
-        
-    def reset_for_new_recording(self):
-        # UI und Variablen für eine neue Aufnahmeserie zurücksetzen
-        self.all_recordings = []
-        self.recording_count = 0
-        self.counter_canvas.itemconfig(self.counter_text, text="0")
-        self.status_label.config(text="Bereit - Klicken Sie auf das Mikrofon")
-        self.check_button.config(state="disabled")
-        
-        if self.finished_label:
-            self.finished_label.pack_forget()
+    # Die alten Methoden wurden durch die neuen ersetzt
         
     def toggle_recording(self):
         # Aufnahme starten oder stoppen
@@ -521,8 +645,6 @@ class DiktierAssistent:
         self.audio_data = []
         self.status_label.config(text="🔴 Aufnahme läuft...")
         self.log_to_ui("Aufnahme gestartet")
-        if self.finished_label:
-            self.finished_label.pack_forget()
         self.record_thread = threading.Thread(target=self.record_audio)
         self.record_thread.start()
         
@@ -555,6 +677,13 @@ class DiktierAssistent:
             self.all_recordings.append(audio_array)
             self.recording_count += 1
             
+            # Audio-Datei speichern
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            audio_filename = f"aufnahme_{self.recording_count:03d}_{timestamp}.wav"
+            audio_path = os.path.join(self.audio_folder, audio_filename)
+            sf.write(audio_path, audio_array, self.sample_rate)
+            print(f"[DEBUG] Audio gespeichert: {audio_filename}")
+            
             self.counter_canvas.itemconfig(self.counter_text, text=str(self.recording_count))
             self.status_label.config(text=f"✅ Aufnahme {self.recording_count} gespeichert")
             
@@ -570,12 +699,8 @@ class DiktierAssistent:
         self.check_button.config(state="disabled")
         self.status_label.config(text="Verarbeite alle Aufnahmen...")
         
-        # Progress bar erstellen wenn noch nicht vorhanden
-        if not self.progress:
-            self.progress = ttk.Progressbar(self.root, mode='indeterminate')
-        
-        self.progress.pack(pady=10, padx=20, fill=tk.X)
-        self.progress.start()
+        # Loading-Animation anzeigen
+        self.show_loading_animation()
         
         # Verarbeitung in einem separaten Thread starten
         process_thread = threading.Thread(target=self.process_all_recordings, daemon=True)
@@ -600,14 +725,34 @@ class DiktierAssistent:
     def process_all_recordings(self):
         """Führt die langwierige Verarbeitung (Audio, Transkription, KI) im Hintergrund durch."""
         try:
-            # Alle Audio-Teile mit einer kurzen Pause dazwischen zusammenfügen
+            # Alle Audio-Dateien aus dem Ordner laden und kombinieren
+            audio_files = sorted([f for f in os.listdir(self.audio_folder) if f.endswith('.wav')])
+            print(f"[DEBUG] Gefundene Audio-Dateien: {len(audio_files)}")
+            
+            if not audio_files:
+                raise Exception("Keine Audio-Dateien zum Verarbeiten gefunden!")
+            
+            # Audio-Dateien laden und zusammenfügen
             pause_samples = int(0.5 * self.sample_rate)
             pause = np.zeros((pause_samples, 1))
             combined_audio = []
-            for i, recording in enumerate(self.all_recordings):
-                combined_audio.append(recording)
-                if i < len(self.all_recordings) - 1:
+            
+            for i, filename in enumerate(audio_files):
+                file_path = os.path.join(self.audio_folder, filename)
+                audio_data, sr = sf.read(file_path)
+                
+                # Falls Stereo, zu Mono konvertieren
+                if len(audio_data.shape) > 1:
+                    audio_data = np.mean(audio_data, axis=1)
+                
+                # Shape anpassen (ensure 2D array)
+                if len(audio_data.shape) == 1:
+                    audio_data = audio_data.reshape(-1, 1)
+                
+                combined_audio.append(audio_data)
+                if i < len(audio_files) - 1:
                     combined_audio.append(pause)
+            
             audio_array = np.concatenate(combined_audio, axis=0)
             
             # Temporäre WAV-Datei erstellen
@@ -630,45 +775,77 @@ class DiktierAssistent:
             transcript = response_transcribe.text
             
             # --- START DER IMPLEMENTIERUNG FÜR DAS ERGÄNZEN ---
-            # Je nach Modus (neu vs. ergänzen) wird ein anderer Prompt für die KI gewählt.
-            if self.append_mode and self.existing_transcript:
-                # Dieser Prompt wird verwendet, wenn ein bestehender Text ergänzt werden soll.
-                prompt_summarize = f"""
+            # Im Ergänzungsmodus: Prüfen ob output.txt existiert
+            if self.append_mode:
+                desktop_path = os.path.join(os.path.expanduser('~'), 'Desktop')
+                output_path = os.path.join(desktop_path, 'DiktierAssistent', 'output.txt')
+                
+                # Versuche existierendes Transkript zu laden
+                existing_content = ""
+                if os.path.exists(output_path):
+                    try:
+                        with open(output_path, 'r', encoding='utf-8') as f:
+                            existing_content = f.read().strip()
+                    except Exception as e:
+                        print(f"Konnte output.txt nicht lesen: {e}")
+                
+                if existing_content:
+                    # output.txt existiert - Inhalt mit neuer Transkription kombinieren
+                    prompt_summarize = f"""
 Du bist eine hochqualifizierte zahnmedizinische Fachassistenz, die eine bestehende Patientendokumentation aktualisieren soll.
 
 **AUFGABE:**
 Integriere die Informationen aus einer neuen Audio-Transkription nahtlos und logisch in eine bereits existierende Dokumentation. Das Ergebnis soll ein einziger, kohärenter und professioneller Text sein, der für die DAMPSOFT-Software formatiert ist.
 
-**BESTEHENDE DOKUMENTATION:**
+**BESTEHENDE DOKUMENTATION (aus output.txt):**
 ```
-{self.existing_transcript}
+{existing_content}
 ```
 
-**NEUE INFORMATIONEN (aus der aktuellen Audio-Transkription):**
+**NEUE INFORMATIONEN (aus der kompletten Audio-Transkription aller Aufnahmen):**
 ```
 {transcript}
 ```
 
 **ANWEISUNGEN:**
 1.  **Analysiere** die bestehende Dokumentation und die neuen Informationen.
-2.  **Fasse** die relevanten Punkte aus der neuen Transkription zusammen.
-3.  **Füge** diese neuen Punkte an den passenden Stellen in die bestehende Dokumentation ein (z.B. neue Befunde zu "BEFUND", neue Maßnahmen zu "THERAPIE").
+2.  **Fasse** ALLE Informationen aus der Transkription zusammen (dies beinhaltet alle bisherigen und neuen Aufnahmen).
+3.  **Füge** diese Punkte an den passenden Stellen in die bestehende Dokumentation ein.
 4.  **Korrigiere oder ergänze** bestehende Punkte, falls die neuen Informationen dies erfordern.
 5.  **Stelle sicher, dass der finale Text keine Wiederholungen enthält** und sich liest wie aus einem Guss.
-6.  **Behalte exakt die folgende Formatierung bei** und fülle die Sektionen entsprechend:
+6.  **Behalte exakt die folgende Formatierung bei**:
     BEFUND:
-    [Alle relevanten Befunde, kombiniert aus alt und neu]
+    [Alle relevanten Befunde, kombiniert]
     DIAGNOSE:
-    [Alle Diagnosen, kombiniert aus alt und neu]
+    [Alle Diagnosen, kombiniert]
     THERAPIE:
-    [Alle Therapieschritte, kombiniert aus alt und neu]
+    [Alle Therapieschritte, kombiniert]
     BEMERKUNGEN:
-    [Alle Bemerkungen, kombiniert aus alt und neu]
+    [Alle Bemerkungen, kombiniert]
 
 Erstelle jetzt die finale, zusammengeführte Dokumentation.
 """
+                else:
+                    # output.txt existiert nicht - normale Transkription aller Aufnahmen
+                    prompt_summarize = f"""
+                Du bist eine zahnmedizinische Fachassistenz. Erstelle aus der folgenden Transkription eine strukturierte Dokumentation für DAMPSOFT.
+                Formatiere die Ausgabe wie folgt:
+                BEFUND:
+                [Hier die relevanten Befunde]
+                DIAGNOSE:
+                [Diagnosen mit ICD-10 wenn möglich (einschließlich der erweiterten oder Folgediagnose
+                Beispiel: Zahnarzt entscheidet sich die Diagnose mit Röntkenbild zu erweitern. Da das ein diagnostischer Schritt ist, würde dieser Punkt unter Diagnose und NICHT unter
+                Therapie fallen)]
+                THERAPIE:
+                [Durchgeführte/geplante Behandlungen]
+                BEMERKUNGEN:
+                [Weitere relevante Informationen]
+                
+                Transkription:
+                {transcript}
+                """
             else:
-                # Dies ist der Standard-Prompt für eine komplett neue Dokumentation.
+                # Normaler Modus (kein Ergänzen) - Standard-Prompt
                 prompt_summarize = f"""
                 Du bist eine zahnmedizinische Fachassistenz. Erstelle aus der folgenden Transkription eine strukturierte Dokumentation für DAMPSOFT.
                 Formatiere die Ausgabe wie folgt:
@@ -715,9 +892,8 @@ Erstelle jetzt die finale, zusammengeführte Dokumentation.
             
     def show_completion(self, summary):
         """UI-Updates nach erfolgreicher Verarbeitung."""
-        if self.progress:
-            self.progress.stop()
-            self.progress.pack_forget()
+        # Loading-Animation ausblenden
+        self.hide_loading_animation()
         
         # Den neuen Text als "bestehendes Transkript" speichern
         self.existing_transcript = summary
@@ -726,43 +902,106 @@ Erstelle jetzt die finale, zusammengeführte Dokumentation.
         self.status_label.config(text="Transkript wurde erfolgreich gespeichert!")
         self.log_to_ui(f"Gespeichert: ~/Desktop/DiktierAssistent/output.txt")
         
-        # Finished Label erstellen wenn noch nicht vorhanden
-        if not self.finished_label:
-            self.finished_label = ttk.Label(self.root, text="✅ FERTIG - Transkript wurde gespeichert!", 
-                                        font=("Arial", 14, "bold"), foreground="green")
-        self.finished_label.pack(pady=20)
-        
         self.check_button.config(state="disabled")
         
-        # Nach einer kurzen Pause die Optionen anzeigen
-        self.root.after(2000, self.show_transcript_options)
+        # WICHTIG: Aufnahmen NICHT löschen, damit sie beim Ergänzen erhalten bleiben!
+        # self.all_recordings = []  # Diese Zeile wurde entfernt
+        # self.recording_count = 0  # Diese Zeile wurde entfernt
         
-    def show_transcript_options(self):
-        # Buttons für "Ergänzen" oder "Neu aufnehmen" anzeigen
-        if self.finished_label:
-            self.finished_label.pack_forget()
+        # Zurück-Pfeil ausblenden, falls er sichtbar war
+        self.back_arrow.place_forget()
         
-        self.status_label.config(text="Was möchten Sie als nächstes tun?")
+        # Modus-Buttons anzeigen statt Mikrofon
+        self.show_mode_selection()
         
-        # Frame erstellen wenn noch nicht vorhanden
-        if not self.transcript_options_frame:
-            self.transcript_options_frame = ttk.Frame(self.root)
-            self.append_button = ttk.Button(self.transcript_options_frame, 
-                                        text="📝 Transkript ergänzen", 
-                                        command=self.set_append_mode)
-            self.append_button.pack(side=tk.LEFT, padx=5)
-            self.new_button = ttk.Button(self.transcript_options_frame, 
-                                        text="🔄 Transkript neu aufnehmen", 
-                                        command=self.set_new_mode)
-            self.new_button.pack(side=tk.LEFT, padx=5)
+    def show_mode_selection(self):
+        """Zeigt die Auswahl-Buttons anstelle des Mikrofons"""
+        self.mode = 'choice'
+        print("[DEBUG] show_mode_selection() aufgerufen")
+        # Mikrofon verstecken
+        self.canvas.itemconfig(self.mic_button, state='hidden')
+        print("[DEBUG] Mikrofon versteckt")
+        # Buttons anzeigen
+        self.canvas.itemconfig(self.mode_buttons_window, state='normal')
+        print("[DEBUG] Mode-Buttons auf 'normal' gesetzt")
+        # Frame sichtbar machen
+        # self.mode_buttons_frame.pack()
+        print("[DEBUG] Frame gepackt")
+        self.status_label.config(
+            text="Transkript gespeichert – Wähle: Neues oder Ergänzen")
         
-        self.transcript_options_frame.pack(pady=10)
+        # Debug: Zeige aktuelle Anzahl der Aufnahmen
+        audio_files = [f for f in os.listdir(self.audio_folder) if f.endswith('.wav')] if os.path.exists(self.audio_folder) else []
+        print(f"[DEBUG] Audio-Dateien im Ordner: {len(audio_files)}")
+    
+    def start_new_transcript(self):
+        """Startet ein komplett neues Transkript"""
+        self.mode = 'recording'
+        self.append_mode = False
+        self.existing_transcript = ""
+        self.has_transcript = False
         
+        # Alle bestehenden Aufnahmen löschen (sowohl im Speicher als auch Dateien)
+        self.all_recordings = []
+        self.recording_count = 0
+        self.counter_canvas.itemconfig(self.counter_text, text="0")
+        
+        # Audio-Dateien im Ordner löschen
+        self.clear_audio_files()
+        
+        # UI zurücksetzen
+        self.canvas.itemconfig(self.mode_buttons_window, state='hidden')
+        self.canvas.itemconfig(self.mic_button, state='normal')
+
+        self.check_button.config(state='disabled')
+        self.status_label.config(text="Neues Transkript - Klicken Sie auf das Mikrofon")
+    
+    def start_append_mode(self):
+        """Startet den Ergänzungsmodus"""
+        self.mode = 'append'
+        self.append_mode = True
+        
+        self.canvas.itemconfig(self.mode_buttons_window, state='hidden')
+        self.canvas.itemconfig(self.mic_button, state='normal')
+        
+        # Passe das 'padx' an, um Platz für den verschobenen Pfeil zu schaffen
+        self.logo_counter_container.pack_configure(side='left', padx=(95, 0), expand=False)
+
+        # Erhöhe den x-Wert, um den Pfeil nach rechts zu rücken
+        self.back_arrow.place(x=130, y=22)
+
+        self.status_label.config(text="Ergänzungsmodus - Fügen Sie weitere Aufnahmen hinzu")
+
+    def cancel_append_mode(self):
+        """Bricht den Ergänzungsmodus ab und kehrt zur Auswahl zurück"""
+        # Den platzierten Pfeil entfernen
+        self.back_arrow.place_forget()
+        
+        # Stelle das ursprüngliche, zentrierte Layout des Containers wieder her.
+        # expand=True zentriert den Container wieder.
+        self.logo_counter_container.pack_configure(side='top', padx=0, expand=True)
+
+        self.mode = 'choice'
+        self.show_mode_selection()
+        
+    def clear_audio_files(self):
+        """Löscht alle Audio-Dateien im Ordner"""
+        try:
+            for filename in os.listdir(self.audio_folder):
+                if filename.endswith('.wav'):
+                    file_path = os.path.join(self.audio_folder, filename)
+                    os.remove(file_path)
+                    print(f"[DEBUG] Audio-Datei gelöscht: {filename}")
+        except Exception as e:
+            print(f"[WARNUNG] Konnte Audio-Dateien nicht löschen: {e}")
+    
     def reset_ui_on_error(self, error_msg):
         """UI-Updates im Fehlerfall."""
-        if self.progress:
-            self.progress.stop()
-            self.progress.pack_forget()
+        # Loading-Animation ausblenden und Mikrofon wieder anzeigen
+        self.hide_loading_animation()
+        
+        # Zurück-Pfeil ausblenden, falls er sichtbar war
+        self.back_arrow.place_forget()
         
         self.status_label.config(text=f"❌ Fehler: {error_msg}", wraplength=480)
         self.log_to_ui(error_msg)
@@ -813,12 +1052,29 @@ Erstelle jetzt die finale, zusammengeführte Dokumentation.
         self.root.lift()
         self.root.focus_force()
         
+    def cleanup_on_exit(self):
+        """Räumt Audio-Dateien beim Beenden auf"""
+        try:
+            self.clear_audio_files()
+            if os.path.exists(self.audio_folder) and not os.listdir(self.audio_folder):
+                os.rmdir(self.audio_folder)
+                print(f"[DEBUG] Audio-Ordner entfernt: {self.audio_folder}")
+        except Exception as e:
+            print(f"[WARNUNG] Cleanup-Fehler: {e}")
+    
+    def signal_handler(self, signum, frame):
+        """Handler für Signale (Ctrl+C, etc.)"""
+        print(f"[DEBUG] Signal {signum} empfangen, räume auf...")
+        self.cleanup_on_exit()
+        sys.exit(0)
+
     def quit_app(self):
         """Beendet die Anwendung komplett"""
         try:
             self.tray_icon.stop()
         except:
             pass
+        self.cleanup_on_exit()
         self.root.quit()
 
 if __name__ == "__main__":
